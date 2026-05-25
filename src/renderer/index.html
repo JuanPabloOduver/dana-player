@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; img-src 'self' data:">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dana Player</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:ital,wght@0,300;0,400;0,500;1,300&family=Unbounded:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+    <!-- ══ CUSTOM TITLE BAR ════════════════════════════════════════════ -->
+    <header class="titlebar">
+        <div class="titlebar-drag"></div>
+        <div class="titlebar-brand">
+            <svg width="14" height="14" viewBox="0 0 14 14"><polygon points="0,14 7,0 14,14" fill="var(--accent)"/></svg>
+            DANA
+        </div>
+        <div class="titlebar-controls">
+            <button class="tb-btn tb-min"   id="tb-min"></button>
+            <button class="tb-btn tb-max"   id="tb-max"></button>
+            <button class="tb-btn tb-close" id="tb-close"></button>
+        </div>
+    </header>
+
+    <!-- ══ APP BODY ════════════════════════════════════════════════════ -->
+    <div class="app-body">
+
+        <!-- ── SIDEBAR ───────────────────────────────────────────────── -->
+        <aside class="sidebar">
+            <div class="sidebar-top">
+                <button class="folder-btn" id="folder-btn">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+                    Open Folder
+                </button>
+                <div class="folder-info">
+                    <span class="folder-path" id="folder-path">no folder selected</span>
+                    <span class="folder-count" id="folder-count"></span>
+                </div>
+            </div>
+
+            <div class="playlist-wrap">
+                <div class="playlist-header-row">
+                    <span class="section-label">LIBRARY</span>
+                </div>
+                <ul class="playlist" id="playlist">
+                    <li class="pl-empty" id="pl-empty">
+                        <div class="pl-empty-icon">
+                            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+                        </div>
+                        <p>No .dana files</p>
+                        <small>Open a folder to begin</small>
+                    </li>
+                </ul>
+            </div>
+
+            <div class="sidebar-footer">
+                <div class="daemon-status">
+                    <span class="daemon-dot" id="daemon-dot"></span>
+                    <span id="daemon-text">connecting…</span>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ── MAIN STAGE ────────────────────────────────────────────── -->
+        <main class="stage">
+
+            <!-- Now playing: cover + info -->
+            <section class="now-playing">
+                <div class="cover-wrap">
+                    <img class="cover-img" id="cover-img" src="" alt="" style="display:none">
+                    <div class="cover-placeholder" id="cover-placeholder">
+                        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/></svg>
+                    </div>
+                </div>
+
+                <div class="np-info">
+                    <div class="np-state" id="np-state">STOPPED</div>
+                    <h2 class="np-title"  id="np-title">Dana Player</h2>
+                    <div class="np-artist" id="np-artist">—</div>
+                    <div class="np-album"  id="np-album"></div>
+                </div>
+
+                <div class="vol-wrap">
+                    <label class="vol-label" for="vol-slider">VOL</label>
+                    <input  class="vol-slider" id="vol-slider" type="range"
+                            min="0" max="200" value="100" step="1">
+                    <span class="vol-value" id="vol-value">100</span>
+                </div>
+            </section>
+
+            <!-- Progress bar -->
+            <div class="progress-wrap">
+                <span class="time-el" id="time-elapsed">0:00</span>
+                <div class="progress-track" id="progress-track">
+                    <div class="progress-fill" id="progress-fill"></div>
+                </div>
+                <span class="time-el" id="time-total">0:00</span>
+            </div>
+
+            <!-- Transport controls -->
+            <nav class="transport">
+                <button class="tp-btn tp-prev" id="tp-prev" title="Previous  [←]">
+                    <svg viewBox="0 0 24 24"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg>
+                </button>
+
+                <button class="tp-btn tp-play" id="tp-play" title="Play / Pause  [Space]">
+                    <svg class="ico-play"  viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                    <svg class="ico-pause" viewBox="0 0 24 24" style="display:none"><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg>
+                </button>
+
+                <button class="tp-btn tp-next" id="tp-next" title="Next  [→]">
+                    <svg viewBox="0 0 24 24"><path d="m5 18 8.5-6L5 6v12zm2-9.33L10.48 12 7 14.33V8.67zM16 6h2v12h-2z"/></svg>
+                </button>
+
+                <button class="tp-btn tp-loop" id="tp-loop" title="Loop  [L]" data-on="false">
+                    <svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>
+                </button>
+            </nav>
+
+            <!-- Lyrics panel -->
+            <div class="lyrics-wrap" id="lyrics-wrap" style="display:none">
+                <div class="lyrics-header">
+                    <span class="section-label">LYRICS</span>
+                    <button class="lyrics-close" id="lyrics-close">✕</button>
+                </div>
+                <div class="lyrics-body" id="lyrics-body"></div>
+            </div>
+
+            <!-- Status row -->
+            <div class="status-row">
+                <span class="sr-item" id="sr-codec">DANA LOSSLESS</span>
+                <span class="sr-sep">·</span>
+                <span class="sr-item" id="sr-fmt">—</span>
+                <span class="sr-sep">·</span>
+                <button class="sr-lyrics-btn" id="sr-lyrics-btn" title="Show lyrics">LYRICS</button>
+            </div>
+
+        </main>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>

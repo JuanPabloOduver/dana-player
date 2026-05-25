@@ -1,0 +1,27 @@
+{
+  "name": "dana-player",
+  "version": "2.0.0",
+  "description": "Desktop player for .dana lossless codec via danaplayerd daemon",
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --inspect",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^29.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "build": {
+    "appId": "com.dana.player",
+    "productName": "Dana Player",
+    "files": ["src/**/*"],
+    "directories": {
+      "output": "dist"
+    },
+    "linux": { "target": "AppImage" },
+    "mac":   { "target": "dmg" },
+    "win":   { "target": "nsis" }
+  }
+}
