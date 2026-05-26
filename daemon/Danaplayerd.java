@@ -1,30 +1,34 @@
 package com.dana.daemon;
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  danaplayerd — Dana Decoder Daemon
+//  danaplayd — Dana Playback Daemon  (protocolo texto, MPD-style)
 //
-//  Proceso independiente que expone el codec .dana a través de un
-//  Unix Domain Socket en /tmp/danaplayerd.sock.
+//  Implementa exactamente la API descrita en el documento de referencia:
+//    IPC Integration Guide & API Reference (DANA Audio Codec Project, 2026)
 //
-//  Responsabilidades:
-//    - Abrir y mantener el Unix Domain Socket como servidor
-//    - Aceptar conexiones del cliente Electron
-//    - Leer comandos JSON length-prefixed del cliente
-//    - Ejecutar el codec en un hilo Productor → pila circular → hilo Consumidor
-//    - Enviar frames PCM crudos y frames JSON de control al cliente
+//  Protocolo:
+//    - Unix Domain Socket en /tmp/danaplayd.sock  (o $DANA_SOCK)
+//    - Una conexión por comando: el cliente abre, envía "comando\n", recibe
+//      la respuesta y el daemon cierra la conexión.
+//    - Respuestas de texto terminan con \n.
+//    - get_cover devuelve bytes binarios crudos (JPEG/PNG) o "NONE\n".
 //
-//  Protocolo de frame (ambas direcciones):
-//    [4 bytes: uint32 big-endian = longitud del payload] [N bytes: payload]
-//
-//    Payload JSON  → comienza con '{'  → mensaje de control
-//    Payload binario → cualquier otro byte → PCM crudo 16-bit LE estéreo
+//  Comandos soportados:
+//    play <filepath>   → OK
+//    pause             → OK   (toggle PLAYING↔PAUSED)
+//    stop              → OK
+//    seek <segundos>   → OK
+//    set_vol <0-200>   → OK
+//    get_data          → JSON (DanaTags completo, ver sección 4 del doc)
+//    get_cover         → bytes binarios o "NONE\n"
+//    quit              → SHUTTING DOWN
 //
 //  Para conectar el codec real:
-//    1. Implementar la interfaz DanaDecoder (al final de este archivo)
-//    2. En startProducer(), cambiar `new StubDecoder()` por la implementación real
-//       (buscar el bloque marcado con // [CODEC])
+//    1. Implementar la interfaz DanaDecoder (al final de este archivo).
+//    2. En startPlayback(), reemplazar `new StubDecoder()` por la
+//       implementación real (bloque marcado con // [CODEC]).
 //
-//  Requisitos: Java 17+ (UnixDomainSocketAddress disponible desde Java 16)
+//  Requisitos: Java 17+   (UnixDomainSocketAddress desde Java 16)
 //  Compilar:   javac Danaplayerd.java
 //  Ejecutar:   java com.dana.daemon.Danaplayerd
 // ═══════════════════════════════════════════════════════════════════════════
@@ -41,25 +45,40 @@ import java.util.concurrent.atomic.*;
 public class Danaplayerd {
 
     // ── Configuración ──────────────────────────────────────────────────────
-    static final String SOCK_PATH   = System.getenv().getOrDefault("DANA_SOCK", "/tmp/danaplayerd.sock");
-    static final int    CHUNK_BYTES = 4096;  // ~23ms a 44100Hz/16bit/estéreo
-    static final int    BUF_CAP     = 64;    // capacidad de la pila circular (chunks)
+    static final String SOCK_PATH = System.getenv().getOrDefault("DANA_SOCK", "/tmp/danaplayd.sock");
 
-    // ── Estado global ──────────────────────────────────────────────────────
-    static final AtomicBoolean running = new AtomicBoolean(true);
-    static volatile SocketChannel clientChannel = null;
+    // ── Estado de reproducción ─────────────────────────────────────────────
+    enum State { STOPPED, PLAYING, PAUSED }
 
-    // ── Pila circular (Productor → Consumidor) ────────────────────────────
-    static ArrayBlockingQueue<byte[]> circularBuf = null;
-    static volatile boolean           bufOpen     = false;
+    static volatile State          state       = State.STOPPED;
+    static volatile String         currentFile = null;
+    static volatile int            volume      = 100;   // 0–200
+    static volatile int            elapsedSec  = 0;
+    static volatile int            durationSec = 0;
 
-    // ── Hilo productor ────────────────────────────────────────────────────
-    static volatile Thread      producerThread = null;
-    static volatile DanaDecoder decoder        = null;
-    static final AtomicBoolean  paused         = new AtomicBoolean(false);
-    static final AtomicBoolean  stopped        = new AtomicBoolean(false);
+    // Metadatos del track actual
+    static volatile String  metaTitle    = "Unknown";
+    static volatile String  metaArtist   = "Unknown";
+    static volatile String  metaAlbum    = "Unknown";
+    static volatile String  metaYear     = "";
+    static volatile String  metaGenre    = "";
+    static volatile String  metaTrack    = "";
+    static volatile String  metaBpm      = "";
+    static volatile String  metaKey      = "";
+    static volatile String  metaLyrics   = "";
+    static volatile boolean hasCover     = false;
+    static volatile byte[]  coverBytes   = null;
 
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Hilo de reproducción (productor + consumidor) ──────────────────────
+    static final AtomicBoolean  pbRunning = new AtomicBoolean(false);
+    static final AtomicBoolean  pbPaused  = new AtomicBoolean(false);
+    static volatile Thread      pbThread  = null;
+    static volatile DanaDecoder decoder   = null;
+
+    // ── Servidor ───────────────────────────────────────────────────────────
+    static final AtomicBoolean serverRunning = new AtomicBoolean(true);
+
+    // ──────────────────────────────────────────────────────────────────────
     public static void main(String[] args) throws Exception {
         Path sockFile = Path.of(SOCK_PATH);
         Files.deleteIfExists(sockFile);
@@ -69,288 +88,451 @@ public class Danaplayerd {
         server.bind(addr);
         server.configureBlocking(true);
 
-        System.out.println("[danaplayerd] Socket abierto en " + SOCK_PATH);
+        System.out.println("[danaplayd] Socket listo en " + SOCK_PATH);
+        System.out.println("[danaplayd] Protocolo: texto plano (MPD-style)");
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            running.set(false);
+            serverRunning.set(false);
+            stopPlayback();
             try { server.close(); Files.deleteIfExists(sockFile); } catch (Exception ignored) {}
-            System.out.println("[danaplayerd] Detenido.");
+            System.out.println("[danaplayd] Detenido limpiamente.");
         }));
 
-        while (running.get()) {
-            System.out.println("[danaplayerd] Esperando cliente…");
-            clientChannel = server.accept();
-            System.out.println("[danaplayerd] Cliente conectado.");
+        // Bucle principal: acepta una conexión, atiende UN comando, cierra.
+        while (serverRunning.get()) {
+            SocketChannel client;
             try {
-                handleClient(clientChannel);
-            } catch (Exception e) {
-                System.err.println("[danaplayerd] Error de cliente: " + e.getMessage());
-            } finally {
-                stopProducer();
-                try { clientChannel.close(); } catch (Exception ignored) {}
-                clientChannel = null;
-                System.out.println("[danaplayerd] Cliente desconectado.");
-            }
-        }
-    }
-
-    // ── Bucle de comandos ─────────────────────────────────────────────────
-    static void handleClient(SocketChannel ch) throws Exception {
-        DataInputStream in = new DataInputStream(Channels.newInputStream(ch));
-
-        while (ch.isOpen()) {
-            int len;
-            try { len = in.readInt(); }
-            catch (EOFException e) { break; }
-
-            if (len <= 0 || len > 1_048_576) {
-                System.err.println("[danaplayerd] Longitud de frame inválida: " + len);
+                client = server.accept();
+            } catch (ClosedChannelException e) {
                 break;
             }
-
-            byte[] payload = new byte[len];
-            in.readFully(payload);
-            handleCommand(new String(payload, StandardCharsets.UTF_8), ch);
+            try {
+                handleConnection(client);
+            } catch (Exception e) {
+                System.err.println("[danaplayd] Error en conexión: " + e.getMessage());
+            } finally {
+                try { client.close(); } catch (Exception ignored) {}
+            }
         }
     }
 
-    static void handleCommand(String json, SocketChannel ch) throws Exception {
-        String cmd  = extractString(json, "cmd");
-        String path = extractString(json, "path");
+    // ── Manejo de una conexión (un comando por conexión) ───────────────────
+    static void handleConnection(SocketChannel ch) throws Exception {
+        BufferedReader reader = new BufferedReader(
+                new InputStreamReader(Channels.newInputStream(ch), StandardCharsets.UTF_8));
 
-        System.out.println("[CMD] " + cmd + (path != null ? " → " + path : ""));
+        String line = reader.readLine();
+        if (line == null || line.isBlank()) return;
 
-        switch (cmd != null ? cmd : "") {
-            case "load_play" -> {
-                stopProducer();
-                if (circularBuf != null) circularBuf.clear();
-                startProducer(path, ch);
-            }
-            case "pause" -> {
-                paused.set(true);
-                sendJson(ch, "{\"type\":\"paused\"}");
-            }
-            case "resume" -> {
-                paused.set(false);
-                sendJson(ch, "{\"type\":\"resumed\"}");
-            }
-            case "stop" -> {
-                stopProducer();
-                sendJson(ch, "{\"type\":\"stopped\"}");
-            }
-            case "get_metadata" -> {
-                // El codec real debe leer los metadatos del header del archivo .dana
-                // y completar los valores reales de sampleRate, channels, bitDepth y durationMs.
-                String fileSafe = path == null ? "" : path.replace("\"", "\\\"");
-                sendJson(ch, String.format(
-                    "{\"type\":\"metadata\",\"data\":{\"sampleRate\":44100,\"channels\":2,\"bitDepth\":16,\"durationMs\":0,\"path\":\"%s\"}}",
-                    fileSafe
-                ));
-            }
-            case "request_chunk" -> {
-                if (circularBuf != null) {
-                    byte[] chunk = circularBuf.poll(50, TimeUnit.MILLISECONDS);
-                    if (chunk != null && chunk.length > 0) sendPcm(ch, chunk);
-                }
-            }
-            case "buffer_open" -> {
-                circularBuf = new ArrayBlockingQueue<>(BUF_CAP);
-                bufOpen     = true;
-                sendJson(ch, "{\"type\":\"buffer_open\"}");
-            }
-            case "buffer_close" -> {
-                stopProducer();
-                circularBuf = null;
-                bufOpen     = false;
-                sendJson(ch, "{\"type\":\"buffer_close\"}");
-            }
-            default -> System.err.println("[danaplayerd] Comando desconocido: " + cmd);
+        line = line.trim();
+        System.out.println("[CMD] " + line);
+
+        if (line.startsWith("play ")) {
+            String path = line.substring(5).trim();
+            cmdPlay(path, ch);
+
+        } else if (line.equals("pause")) {
+            cmdPause(ch);
+
+        } else if (line.equals("stop")) {
+            cmdStop(ch);
+
+        } else if (line.startsWith("seek ")) {
+            String arg = line.substring(5).trim();
+            cmdSeek(arg, ch);
+
+        } else if (line.startsWith("set_vol ")) {
+            String arg = line.substring(8).trim();
+            cmdSetVol(arg, ch);
+
+        } else if (line.equals("get_data")) {
+            cmdGetData(ch);
+
+        } else if (line.equals("get_cover")) {
+            cmdGetCover(ch);
+
+        } else if (line.equals("quit")) {
+            sendText(ch, "SHUTTING DOWN");
+            serverRunning.set(false);
+            stopPlayback();
+            System.exit(0);
+
+        } else {
+            sendText(ch, "ERROR: UNKNOWN COMMAND");
         }
     }
 
-    // ── Productor + Consumidor ────────────────────────────────────────────
-    static void startProducer(String filePath, SocketChannel ch) {
-        stopped.set(false);
-        paused.set(false);
+    // ══════════════════════════════════════════════════════════════════════
+    //  Implementaciones de comandos
+    // ══════════════════════════════════════════════════════════════════════
 
-        if (circularBuf == null) {
-            circularBuf = new ArrayBlockingQueue<>(BUF_CAP);
-            bufOpen     = true;
+    // ── play <filepath> ────────────────────────────────────────────────────
+    static void cmdPlay(String filePath, SocketChannel ch) throws Exception {
+        if (filePath == null || filePath.isEmpty()) {
+            sendText(ch, "ERROR: filepath required");
+            return;
         }
 
-        // [CODEC] ─────────────────────────────────────────────────────────
-        // Sustituir StubDecoder por la implementación real del codec .dana.
-        // La clase debe implementar la interfaz DanaDecoder definida al final
-        // de este archivo.
+        // Detener reproducción previa
+        stopPlayback();
+
+        // Resetear metadatos
+        currentFile  = filePath;
+        elapsedSec   = 0;
+        metaTitle    = fileBaseName(filePath);
+        metaArtist   = "Unknown";
+        metaAlbum    = "Unknown";
+        metaYear     = "";
+        metaGenre    = "";
+        metaTrack    = "";
+        metaBpm      = "";
+        metaKey      = "";
+        metaLyrics   = "";
+        hasCover     = false;
+        coverBytes   = null;
+        durationSec  = 0;
+        state        = State.PLAYING;
+
+        startPlayback(filePath);
+        sendText(ch, "OK");
+    }
+
+    // ── pause (toggle PLAYING ↔ PAUSED) ───────────────────────────────────
+    static void cmdPause(SocketChannel ch) throws Exception {
+        if (state == State.PLAYING) {
+            state = State.PAUSED;
+            pbPaused.set(true);
+            System.out.println("[danaplayd] Pausado.");
+        } else if (state == State.PAUSED) {
+            state = State.PLAYING;
+            pbPaused.set(false);
+            System.out.println("[danaplayd] Reanudado.");
+        }
+        // Si está STOPPED no hace nada, pero responde OK igualmente.
+        sendText(ch, "OK");
+    }
+
+    // ── stop ───────────────────────────────────────────────────────────────
+    static void cmdStop(SocketChannel ch) throws Exception {
+        stopPlayback();
+        state       = State.STOPPED;
+        elapsedSec  = 0;
+        currentFile = null;
+        sendText(ch, "OK");
+    }
+
+    // ── seek <segundos> ────────────────────────────────────────────────────
+    static void cmdSeek(String arg, SocketChannel ch) throws Exception {
+        try {
+            int target = Integer.parseInt(arg);
+            if (decoder != null) {
+                decoder.seek(target);
+                elapsedSec = target;
+            }
+            // Si el decoder no soporta seek, ignoramos silenciosamente (doc: "safely ignore")
+        } catch (NumberFormatException e) {
+            sendText(ch, "ERROR: invalid seek value");
+            return;
+        }
+        sendText(ch, "OK");
+    }
+
+    // ── set_vol <0-200> ────────────────────────────────────────────────────
+    static void cmdSetVol(String arg, SocketChannel ch) throws Exception {
+        try {
+            int v = Integer.parseInt(arg);
+            volume = Math.max(0, Math.min(200, v));
+            if (decoder != null) decoder.setVolume(volume);
+        } catch (NumberFormatException e) {
+            sendText(ch, "ERROR: invalid volume value");
+            return;
+        }
+        sendText(ch, "OK");
+    }
+
+    // ── get_data → JSON DanaTags ───────────────────────────────────────────
+    static void cmdGetData(SocketChannel ch) throws Exception {
+        String stateStr = switch (state) {
+            case PLAYING -> "PLAYING";
+            case PAUSED  -> "PAUSED";
+            case STOPPED -> "STOPPED";
+        };
+
+        String json = buildDanaTagsJson(stateStr);
+        sendText(ch, json);
+    }
+
+    // ── get_cover → bytes binarios o "NONE\n" ──────────────────────────────
+    static void cmdGetCover(SocketChannel ch) throws Exception {
+        if (!hasCover || coverBytes == null || coverBytes.length == 0) {
+            sendText(ch, "NONE");
+            return;
+        }
+        // Enviar los bytes crudos directamente (sin framing, sin base64)
+        OutputStream out = Channels.newOutputStream(ch);
+        out.write(coverBytes);
+        out.flush();
+        System.out.println("[get_cover] Enviados " + coverBytes.length + " bytes.");
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  Pipeline de reproducción
+    // ══════════════════════════════════════════════════════════════════════
+
+    static void startPlayback(String filePath) {
+        pbRunning.set(true);
+        pbPaused.set(false);
+
+        // [CODEC] ──────────────────────────────────────────────────────────
+        // Reemplazar StubDecoder por la implementación real del codec .dana.
         decoder = new StubDecoder();
-        // ─────────────────────────────────────────────────────────────────
+        // ──────────────────────────────────────────────────────────────────
 
-        producerThread = new Thread(() -> {
+        pbThread = new Thread(() -> {
             try {
                 decoder.open(filePath);
 
-                // Hilo Consumidor: extrae de la pila circular y envía PCM al cliente
-                Thread consumerThread = new Thread(() -> {
-                    try {
-                        while (!stopped.get() || !circularBuf.isEmpty()) {
-                            while (paused.get() && !stopped.get()) Thread.sleep(10);
-                            byte[] chunk = circularBuf.poll(100, TimeUnit.MILLISECONDS);
-                            if (chunk == null) continue;
-                            if (chunk.length == 0) break; // pill de veneno → fin de stream
-                            sendPcm(ch, chunk);
-                        }
-                        if (!stopped.get()) {
-                            sendJson(ch, "{\"type\":\"track_end\"}");
-                        }
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    } catch (Exception e) {
-                        System.err.println("[Consumidor] " + e.getMessage());
-                    }
-                }, "dana-consumer");
-                consumerThread.setDaemon(true);
-                consumerThread.start();
-
-                // Hilo Productor: decodifica y llena la pila circular
-                while (!stopped.get() && decoder.hasMore()) {
-                    while (paused.get() && !stopped.get()) Thread.sleep(5);
-                    byte[] chunk = decoder.readNextChunk(CHUNK_BYTES);
-                    if (chunk == null || chunk.length == 0) break;
-                    circularBuf.put(chunk); // bloquea si la pila está llena (backpressure)
+                // Leer metadatos del codec (cover, tags, duración)
+                DanaMetadata meta = decoder.readMetadata();
+                if (meta != null) {
+                    if (meta.title    != null) metaTitle   = meta.title;
+                    if (meta.artist   != null) metaArtist  = meta.artist;
+                    if (meta.album    != null) metaAlbum   = meta.album;
+                    if (meta.year     != null) metaYear    = meta.year;
+                    if (meta.genre    != null) metaGenre   = meta.genre;
+                    if (meta.track    != null) metaTrack   = meta.track;
+                    if (meta.bpm      != null) metaBpm     = meta.bpm;
+                    if (meta.key      != null) metaKey     = meta.key;
+                    if (meta.lyrics   != null) metaLyrics  = meta.lyrics;
+                    durationSec = meta.durationSec;
+                    hasCover    = meta.hasCover;
+                    coverBytes  = meta.coverBytes;
                 }
 
-                circularBuf.put(new byte[0]); // pill de veneno para el consumidor
-                consumerThread.join(5000);
+                // Bucle de decodificación: mantiene elapsed actualizado
+                // El audio real se reproduce por el sistema de audio del codec;
+                // aquí solo medimos el tiempo para reportarlo en get_data.
+                long startNano = System.nanoTime();
+                int  startElapsed = elapsedSec;
+
+                while (pbRunning.get() && decoder.hasMore()) {
+                    while (pbPaused.get() && pbRunning.get()) Thread.sleep(10);
+                    if (!pbRunning.get()) break;
+
+                    decoder.decodeNextFrame();
+
+                    // Actualizar elapsed desde el codec o por tiempo real
+                    int reported = decoder.getElapsedSeconds();
+                    elapsedSec = (reported >= 0) ? reported
+                            : (startElapsed + (int)((System.nanoTime() - startNano) / 1_000_000_000L));
+                }
+
+                if (pbRunning.get()) {
+                    // Llegó al final de forma natural
+                    state      = State.STOPPED;
+                    elapsedSec = durationSec;
+                    System.out.println("[danaplayd] Track finalizado: " + filePath);
+                }
 
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
-                System.err.println("[Productor] " + e.getMessage());
-                try {
-                    sendJson(ch, "{\"type\":\"error\",\"message\":\"" +
-                        e.getMessage().replace("\"", "'") + "\"}");
-                } catch (Exception ignored) {}
+                System.err.println("[Playback] Error: " + e.getMessage());
+                state = State.STOPPED;
             } finally {
                 if (decoder != null) {
                     try { decoder.close(); } catch (Exception ignored) {}
+                    decoder = null;
                 }
             }
-        }, "dana-producer");
-        producerThread.setDaemon(true);
-        producerThread.start();
+        }, "dana-playback");
+        pbThread.setDaemon(true);
+        pbThread.start();
     }
 
-    static void stopProducer() {
-        stopped.set(true);
-        if (producerThread != null) {
-            producerThread.interrupt();
-            producerThread = null;
+    static void stopPlayback() {
+        pbRunning.set(false);
+        pbPaused.set(false);
+        if (pbThread != null) {
+            pbThread.interrupt();
+            try { pbThread.join(2000); } catch (InterruptedException ignored) {}
+            pbThread = null;
         }
-        if (circularBuf != null) circularBuf.clear();
-    }
-
-    // ── Envío de frames al cliente ────────────────────────────────────────
-    static synchronized void sendJson(SocketChannel ch, String json) throws Exception {
-        if (ch == null || !ch.isOpen()) return;
-        byte[]     payload = json.getBytes(StandardCharsets.UTF_8);
-        ByteBuffer frame   = ByteBuffer.allocate(4 + payload.length);
-        frame.putInt(payload.length);
-        frame.put(payload);
-        frame.flip();
-        while (frame.hasRemaining()) ch.write(frame);
-    }
-
-    static synchronized void sendPcm(SocketChannel ch, byte[] pcm) {
-        if (ch == null || !ch.isOpen() || pcm.length == 0) return;
-        try {
-            ByteBuffer frame = ByteBuffer.allocate(4 + pcm.length);
-            frame.putInt(pcm.length);
-            frame.put(pcm);
-            frame.flip();
-            while (frame.hasRemaining()) ch.write(frame);
-        } catch (Exception e) {
-            System.err.println("[sendPcm] " + e.getMessage());
+        if (decoder != null) {
+            try { decoder.close(); } catch (Exception ignored) {}
+            decoder = null;
         }
     }
 
-    // ── Extractor JSON minimalista (sin dependencias externas) ─────────────
-    static String extractString(String json, String key) {
-        String pat = "\"" + key + "\":\"";
-        int s = json.indexOf(pat);
-        if (s < 0) return null;
-        s += pat.length();
-        int e = json.indexOf('"', s);
-        return e < 0 ? null : json.substring(s, e);
+    // ══════════════════════════════════════════════════════════════════════
+    //  Helpers
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Envía texto + \n al cliente. */
+    static void sendText(SocketChannel ch, String text) throws Exception {
+        byte[] bytes = (text + "\n").getBytes(StandardCharsets.UTF_8);
+        ByteBuffer buf = ByteBuffer.wrap(bytes);
+        while (buf.hasRemaining()) ch.write(buf);
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
+    /** Construye el JSON de DanaTags según el esquema del documento (sección 4). */
+    static String buildDanaTagsJson(String stateStr) {
+        return "{"
+                + "\"state\":"       + jsonStr(stateStr)   + ","
+                + "\"file\":"        + jsonStr(currentFile != null ? currentFile : "") + ","
+                + "\"title\":"       + jsonStr(metaTitle)  + ","
+                + "\"artist\":"      + jsonStr(metaArtist) + ","
+                + "\"album\":"       + jsonStr(metaAlbum)  + ","
+                + "\"year\":"        + jsonStr(metaYear)   + ","
+                + "\"genre\":"       + jsonStr(metaGenre)  + ","
+                + "\"track\":"       + jsonStr(metaTrack)  + ","
+                + "\"bpm\":"         + jsonStr(metaBpm)    + ","
+                + "\"key\":"         + jsonStr(metaKey)    + ","
+                + "\"lyrics\":"      + jsonStr(metaLyrics) + ","
+                + "\"has_cover\":"   + hasCover            + ","
+                + "\"time\":"        + elapsedSec          + ","
+                + "\"duration\":"    + durationSec         + ","
+                + "\"volume\":"      + volume
+                + "}";
+    }
+
+    /** Escapa y envuelve un valor en comillas JSON. */
+    static String jsonStr(String s) {
+        if (s == null) return "\"\"";
+        return "\"" + s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+                + "\"";
+    }
+
+    /** Extrae el nombre base de un path (sin extensión). */
+    static String fileBaseName(String path) {
+        if (path == null) return "Unknown";
+        int slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+        String name = (slash >= 0) ? path.substring(slash + 1) : path;
+        int dot = name.lastIndexOf('.');
+        return dot > 0 ? name.substring(0, dot) : name;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
     //  Interfaz DanaDecoder
     //
-    //  Contrato que debe cumplir la implementación del codec .dana.
-    //  Sustituir StubDecoder por la clase concreta en startProducer().
-    // ═══════════════════════════════════════════════════════════════════════
+    //  Contrato que debe cumplir la implementación real del codec .dana.
+    //  Reemplazar StubDecoder por la clase concreta en startPlayback().
+    // ══════════════════════════════════════════════════════════════════════
     interface DanaDecoder {
-        /** Abre el archivo .dana en filePath y prepara el estado interno del codec. */
+        /** Abre el archivo y prepara el estado interno del codec. */
         void open(String filePath) throws Exception;
 
         /**
-         * Decodifica y devuelve hasta `size` bytes de PCM crudo.
-         * Formato de salida: 16-bit signed, little-endian, 44100 Hz, estéreo (interleaved L/R).
-         * Devuelve un array vacío (length == 0) al llegar a EOF.
+         * Lee los metadatos del header del archivo (DanaTags, cover art, etc.)
+         * Llamar una sola vez justo después de open().
+         * Puede devolver null si el codec no soporta metadatos todavía.
          */
-        byte[] readNextChunk(int size) throws Exception;
+        DanaMetadata readMetadata() throws Exception;
 
-        /** Devuelve true mientras haya datos sin decodificar en el archivo. */
+        /** Decodifica y reproduce el siguiente frame de audio. */
+        void decodeNextFrame() throws Exception;
+
+        /** Devuelve true mientras haya frames sin decodificar. */
         boolean hasMore();
 
-        /** Libera todos los recursos del codec (handles de archivo, buffers internos, etc.). */
+        /**
+         * Devuelve el tiempo reproducido en segundos según el codec,
+         * o -1 si el codec no lleva cuenta (el daemon usará tiempo real).
+         */
+        int getElapsedSeconds();
+
+        /**
+         * Salta a la posición indicada (en segundos).
+         * Si el archivo no tiene tabla de seek (SKTB), ignorar silenciosamente.
+         */
+        void seek(int seconds) throws Exception;
+
+        /** Ajusta el volumen interno del codec (0–200). */
+        void setVolume(int volume);
+
+        /** Libera todos los recursos (handles de archivo, buffers, etc.). */
         void close() throws Exception;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════
-    //  StubDecoder — generador de prueba (tono senoidal 440 Hz, 30 segundos)
+    // ══════════════════════════════════════════════════════════════════════
+    //  DanaMetadata — contenedor de metadatos devuelto por readMetadata()
+    // ══════════════════════════════════════════════════════════════════════
+    static class DanaMetadata {
+        String  title, artist, album, year, genre, track, bpm, key, lyrics;
+        int     durationSec;
+        boolean hasCover;
+        byte[]  coverBytes;   // null si no hay portada
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    //  StubDecoder — decodificador de prueba
     //
-    //  Permite verificar toda la pipeline de audio de forma autónoma antes
-    //  de conectar el codec real. Sustituir por DanaDecoder real en producción.
-    // ═══════════════════════════════════════════════════════════════════════
+    //  Simula una pista de 30 segundos sin audio real.
+    //  Permite verificar la pipeline de IPC antes de conectar el codec real.
+    //  Reemplazar por DanaDecoder real en producción.
+    // ══════════════════════════════════════════════════════════════════════
     static class StubDecoder implements DanaDecoder {
 
-        private static final int    SAMPLE_RATE = 44100;
-        private static final double FREQ_HZ     = 440.0;
-        private static final int    DURATION_S  = 30;
+        private static final int DURATION_S = 30;
+        private static final int SAMPLE_RATE = 44100;
 
-        private long    sampleIndex = 0;
-        private final long totalFrames = (long) SAMPLE_RATE * DURATION_S;
-        private boolean done = false;
+        private long   frameIndex   = 0;
+        private long   totalFrames  = (long) SAMPLE_RATE * DURATION_S;
+        private boolean done        = false;
+        private String  openedPath  = null;
+        private int     volume      = 100;
 
         @Override
         public void open(String filePath) {
-            sampleIndex = 0;
+            frameIndex  = 0;
             done        = false;
-            System.out.println("[StubDecoder] Generando tono de prueba para: " + filePath);
+            openedPath  = filePath;
+            System.out.println("[StubDecoder] Abierto (stub): " + filePath);
         }
 
         @Override
-        public byte[] readNextChunk(int size) {
-            int frames = size / 4; // 4 bytes por frame estéreo (2 × int16)
-            if (sampleIndex + frames >= totalFrames) {
-                frames = (int) (totalFrames - sampleIndex);
-                done   = true;
-            }
-            if (frames <= 0) return new byte[0];
-
-            ByteBuffer buf = ByteBuffer.allocate(frames * 4).order(ByteOrder.LITTLE_ENDIAN);
-            for (int i = 0; i < frames; i++) {
-                double t = (double) (sampleIndex + i) / SAMPLE_RATE;
-                short  s = (short) (Short.MAX_VALUE * 0.5 * Math.sin(2.0 * Math.PI * FREQ_HZ * t));
-                buf.putShort(s); // canal izquierdo
-                buf.putShort(s); // canal derecho
-            }
-            sampleIndex += frames;
-            return buf.array();
+        public DanaMetadata readMetadata() {
+            DanaMetadata m = new DanaMetadata();
+            m.title       = fileBaseName(openedPath);
+            m.artist      = "Unknown";
+            m.album       = "Unknown";
+            m.year        = "";
+            m.genre       = "";
+            m.track       = "01";
+            m.bpm         = "";
+            m.key         = "";
+            m.lyrics      = "";
+            m.durationSec = DURATION_S;
+            m.hasCover    = false;
+            m.coverBytes  = null;
+            return m;
         }
 
-        @Override public boolean hasMore() { return !done; }
-        @Override public void close()      { done = true;  }
+        @Override
+        public void decodeNextFrame() throws Exception {
+            if (done) return;
+            // Simular tiempo de procesamiento de ~23ms por frame (4096 bytes a 44100Hz)
+            Thread.sleep(23);
+            frameIndex += (long)(SAMPLE_RATE * 0.023); // ~1021 samples por tick
+            if (frameIndex >= totalFrames) done = true;
+        }
+
+        @Override public boolean hasMore()           { return !done; }
+        @Override public int    getElapsedSeconds()  { return (int)(frameIndex / SAMPLE_RATE); }
+
+        @Override
+        public void seek(int seconds) {
+            frameIndex = Math.min((long) seconds * SAMPLE_RATE, totalFrames);
+            done       = frameIndex >= totalFrames;
+            System.out.println("[StubDecoder] Seek a " + seconds + "s");
+        }
+
+        @Override public void setVolume(int v) { this.volume = v; }
+        @Override public void close()          { done = true; }
     }
 }

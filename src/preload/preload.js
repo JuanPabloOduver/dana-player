@@ -44,8 +44,18 @@ contextBridge.exposeInMainWorld('api', {
     refresh: () =>
         ipcRenderer.send('cmd-refresh'),
 
-    // ── File system ────────────────────────────────────────────────────────
+    setEq: (band, gain) =>
+        ipcRenderer.send('cmd-eq', { band, gain }),
 
+    seek: (seconds) =>
+        ipcRenderer.send('cmd-seek', { seconds }),
+
+    // ── File system ────────────────────────────────────────────────────────
+    watchFolder: (folderPath) =>
+        ipcRenderer.send('watch-folder', folderPath),
+
+    onFolderChanged: (cb) =>
+        ipcRenderer.on('folder-changed', () => cb()),
     /** Scan a folder and return an array of .dana track objects */
     scanFolder: (folderPath) =>
         ipcRenderer.invoke('scan-folder', folderPath),
@@ -97,3 +107,5 @@ contextBridge.exposeInMainWorld('api', {
     removeAllListeners: (channel) =>
         ipcRenderer.removeAllListeners(channel),
 });
+
+

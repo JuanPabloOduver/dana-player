@@ -26,8 +26,10 @@ buildNumber.properties
 Thumbs.db
 
 # Carpeta de música (opcional, donde pongas los .dana)
-music/
+Music/
 *.dana
 
 # Nunca, NUNCA subir node_modules
 node_modules/
+
+danaplayd/danaplayd

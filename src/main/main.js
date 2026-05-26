@@ -4,10 +4,9 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs   = require('fs');
 const net  = require('net');
-const os   = require('os');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const SOCK_PATH    = process.env.DANA_SOCK || '/tmp/danaplayd.sock';
+const SOCK_PATH        = process.env.DANA_SOCK || '/tmp/danaplayd.sock';
 const POLL_INTERVAL_MS = 1000;   // get_data polling frequency
 const CMD_TIMEOUT_MS   = 3000;   // max wait for a daemon response
 
@@ -15,6 +14,7 @@ const CMD_TIMEOUT_MS   = 3000;   // max wait for a daemon response
 let mainWindow   = null;
 let pollTimer    = null;
 let lastFilePath = null;   // tracks when the file changed (for cover art)
+let folderWatcher = null;  // fs.watch handle for the music folder
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -36,13 +36,22 @@ function createWindow() {
     mainWindow.on('closed', () => { mainWindow = null; });
 }
 
+ipcMain.on('cmd-eq', (_, { band, gain }) => {
+    sendCommand(`set_eq ${band} ${gain}`);
+});
+
+ipcMain.on('cmd-seek', (_, { seconds }) => {
+    sendCommand(`seek ${seconds}`);
+});
 app.whenReady().then(() => {
     createWindow();
+    sendCommand('stop');
     startPolling();
 });
 
 app.on('window-all-closed', () => {
     stopPolling();
+    if (folderWatcher) { folderWatcher.close(); folderWatcher = null; }
     app.quit();
 });
 
@@ -51,9 +60,6 @@ app.on('window-all-closed', () => {
  * Opens a fresh connection to danaplayd, sends `command\n`,
  * collects the full response until the socket closes, then resolves.
  *
- * The daemon closes the connection after each response, so we simply
- * accumulate all received bytes and resolve on 'end'.
- *
  * @param {string} command  e.g. 'play /abs/path/song.dana'
  * @param {boolean} binary  if true, resolves with a Buffer instead of a string
  * @returns {Promise<string|Buffer>}
@@ -61,18 +67,13 @@ app.on('window-all-closed', () => {
 function daemonRequest(command, binary = false) {
     return new Promise((resolve, reject) => {
         const chunks = [];
-        let   settled = false;
+        let settled  = false;
 
         const sock = net.createConnection({ path: SOCK_PATH });
         sock.setTimeout(CMD_TIMEOUT_MS);
 
-        sock.on('connect', () => {
-            sock.write(command + '\n');
-        });
-
-        sock.on('data', (chunk) => {
-            chunks.push(chunk);
-        });
+        sock.on('connect', () => { sock.write(command + '\n'); });
+        sock.on('data',    (chunk) => { chunks.push(chunk); });
 
         sock.on('end', () => {
             if (settled) return;
@@ -97,8 +98,7 @@ function daemonRequest(command, binary = false) {
 }
 
 /**
- * Sends a fire-and-forget command (play, pause, stop, set_vol).
- * Resolves with the daemon's text reply (usually 'OK').
+ * Sends a command and logs the reply. Returns null on failure.
  */
 async function sendCommand(command) {
     try {
@@ -133,13 +133,11 @@ async function pollDaemon() {
 
     sendToWindow('daemon-status', { connected: true });
 
-    // The daemon returns a serialised JSON object (DanaTags)
     let tags;
     try {
         tags = JSON.parse(raw);
     } catch (_) {
-        // get_data not yet ready or returned plain text — ignore this tick
-        return;
+        return; // get_data not yet ready — ignore this tick
     }
 
     sendToWindow('dana-tags', tags);
@@ -170,13 +168,9 @@ async function fetchCoverArt() {
 
     if (!imgBuffer || imgBuffer.length === 0) return;
 
-    // Convert to base64 data-URL so the renderer can set it on <img src>
-    // without needing file-system access
     const b64     = imgBuffer.toString('base64');
-    // Detect image format from magic bytes
     const mime    = detectImageMime(imgBuffer);
     const dataUrl = `data:${mime};base64,${b64}`;
-
     sendToWindow('cover-art', dataUrl);
 }
 
@@ -185,50 +179,44 @@ function detectImageMime(buf) {
     if (buf[0] === 0x89 && buf[1] === 0x50) return 'image/png';
     if (buf[0] === 0x47 && buf[1] === 0x49) return 'image/gif';
     if (buf[0] === 0x52 && buf[1] === 0x49) return 'image/webp';
-    return 'image/jpeg'; // safe fallback
+    return 'image/jpeg';
 }
 
 // ─── IPC: Renderer → Main ────────────────────────────────────────────────────
 
-// Play a specific file path
+// Playback commands
 ipcMain.on('cmd-play', (_, { filePath }) => {
     sendCommand(`play ${filePath}`);
 });
 
-// Pause
 ipcMain.on('cmd-pause', () => {
     sendCommand('pause');
 });
 
-// Resume (same command as un-pause on MPD-style daemons)
 ipcMain.on('cmd-resume', () => {
     sendCommand('pause'); // toggle — daemon handles pause/resume state
 });
 
-// Stop
 ipcMain.on('cmd-stop', () => {
     sendCommand('stop');
     lastFilePath = null;
     sendToWindow('cover-art', null);
 });
 
-// Volume: 0–200
 ipcMain.on('cmd-set-vol', (_, { volume }) => {
     const v = Math.max(0, Math.min(200, Math.round(volume)));
     sendCommand(`set_vol ${v}`);
 });
 
-// Force an immediate get_data poll (e.g. right after play)
 ipcMain.on('cmd-refresh', () => {
     pollDaemon();
 });
 
-// File system: scan folder for .dana files
+// File system
 ipcMain.handle('scan-folder', async (_, folderPath) => {
     return scanDanaFiles(folderPath);
 });
 
-// Open folder picker dialog
 ipcMain.handle('open-folder-dialog', async () => {
     const result = await dialog.showOpenDialog(mainWindow, {
         properties: ['openDirectory'],
@@ -236,6 +224,23 @@ ipcMain.handle('open-folder-dialog', async () => {
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
+});
+
+// Watch folder for new/removed .dana files
+ipcMain.on('watch-folder', (event, folderPath) => {
+    if (folderWatcher) { folderWatcher.close(); folderWatcher = null; }
+
+    let debounce = null;
+    try {
+        folderWatcher = fs.watch(folderPath, { persistent: false }, () => {
+            clearTimeout(debounce);
+            debounce = setTimeout(() => {
+                event.sender.send('folder-changed');
+            }, 300);
+        });
+    } catch (err) {
+        console.error('[FS] watch-folder failed:', err.message);
+    }
 });
 
 // Window controls
