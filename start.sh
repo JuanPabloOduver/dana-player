@@ -1,7 +1,7 @@
 # start.sh — poner en la raíz del proyecto
 #!/bin/bash
 echo "Iniciando danaplayd..."
-./danaplayerd/danaplayd &
+./danaplayd/danaplayd &
 DAEMON_PID=$!
 
 # Esperar a que el socket exista (máx 5 segundos)

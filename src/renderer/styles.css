@@ -233,6 +233,9 @@ html, body {
 .vinyl-container.is-playing .vinyl-record {
     animation-play-state: running;
 }
+.vinyl-container.is-paused .vinyl-record {
+    animation-play-state: paused;
+}
 @keyframes spin { 100% { transform: rotate(360deg); } }
 
 /* ── Tonearm ─────────────────────────────────────────────────── */
@@ -257,11 +260,11 @@ html, body {
     pointer-events: none;
     z-index: 10;
     transform-origin: 50% 5%;   /* matches SVG pivot cx=40 of 80, cy=10 of 200 */
-    transform: rotate(30deg);
+    transform: rotate(-35deg);
     transition: transform 1.1s cubic-bezier(0.25, 0.46, 0.45, 0.94);
     filter: drop-shadow(0 4px 14px rgba(0,0,0,0.8));
 }
-.vinyl-container.is-playing .tonearm-wrap {
+.vinyl-container.spinning .tonearm-wrap {
     transform: rotate(2deg);
 }
 
